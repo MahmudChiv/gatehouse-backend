@@ -18,6 +18,12 @@ export class NombaService {
   // 25 minutes in ms — refresh before 30-min expiry
   private readonly REFRESH_THRESHOLD_MS = 25 * 60 * 1000;
 
+  /**
+   * In-flight fetch lock — ensures concurrent callers share a single
+   * token fetch rather than stampeding the Nomba auth endpoint.
+   */
+  private fetchingToken: Promise<string> | null = null;
+
   private readonly baseUrl: string;
   private readonly accountId: string;
   private readonly clientId: string;
@@ -35,7 +41,8 @@ export class NombaService {
   /**
    * Returns a valid Nomba access token.
    * Serves from in-memory cache if token is younger than 25 minutes.
-   * Fetches fresh token otherwise.
+   * If a fetch is already in progress (e.g. from concurrent unit creation),
+   * all callers await the same promise instead of firing duplicate requests.
    */
   async getAccessToken(): Promise<string> {
     const now = new Date();
@@ -46,6 +53,12 @@ export class NombaService {
         this.logger.debug('Returning cached Nomba access token');
         return this.tokenCache.accessToken;
       }
+    }
+
+    // If a fetch is already in flight, share it — don't fire a second request
+    if (this.fetchingToken) {
+      this.logger.debug('Token fetch already in progress — awaiting shared promise');
+      return this.fetchingToken;
     }
 
     return this.fetchAndCacheToken();
@@ -62,6 +75,14 @@ export class NombaService {
   }
 
   private async fetchAndCacheToken(): Promise<string> {
+    // Set the shared in-flight promise so concurrent callers wait on this
+    this.fetchingToken = this._doFetchToken().finally(() => {
+      this.fetchingToken = null;
+    });
+    return this.fetchingToken;
+  }
+
+  private async _doFetchToken(): Promise<string> {
     try {
       this.logger.log('Fetching fresh Nomba access token...');
 
@@ -84,6 +105,9 @@ export class NombaService {
       const accessToken: string = response.data?.data?.access_token ?? response.data?.access_token;
 
       if (!accessToken) {
+        this.logger.error(
+          `Nomba auth response missing access_token. Full response: ${JSON.stringify(response.data)}`,
+        );
         throw new Error('No access_token in Nomba response');
       }
 
@@ -95,7 +119,10 @@ export class NombaService {
       this.logger.log('✅ Nomba access token cached successfully');
       return accessToken;
     } catch (error: any) {
-      this.logger.error('Failed to obtain Nomba access token', error?.response?.data ?? error?.message);
+      const detail = error?.response
+        ? `HTTP ${error.response.status}: ${JSON.stringify(error.response.data)}`
+        : error?.message;
+      this.logger.error(`Failed to obtain Nomba access token — ${detail}`);
       throw new HttpException(
         'Failed to connect to Nomba — check credentials and try again',
         HttpStatus.BAD_GATEWAY,
@@ -137,11 +164,31 @@ export class NombaService {
 
       const data = response.data?.data ?? response.data;
 
-      return {
-        accountNumber: data.accountNumber ?? data.account_number,
-        accountName: data.accountName ?? data.account_name ?? params.accountName,
-        bankName: data.bankName ?? data.bank_name ?? 'Nomba',
-      };
+      // Nomba sandbox returns `bankAccountNumber` / `bankAccountName`
+      // Some API versions may return `accountNumber` / `accountName` — handle both
+      const accountNumber =
+        data.bankAccountNumber ??
+        data.accountNumber ??
+        data.account_number;
+
+      if (!accountNumber) {
+        this.logger.error(
+          `Nomba virtual account response missing account number. Full data: ${JSON.stringify(data)}`,
+        );
+        throw new Error(
+          `Nomba did not return an account number for ${params.accountName}`,
+        );
+      }
+
+      const accountName =
+        data.bankAccountName ??
+        data.accountName ??
+        data.account_name ??
+        params.accountName;
+
+      const bankName = data.bankName ?? data.bank_name ?? 'Nomba';
+
+      return { accountNumber, accountName, bankName };
     } catch (error: any) {
       this.logger.error(
         `Failed to create virtual account for ${params.accountName}`,
