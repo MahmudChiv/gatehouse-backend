@@ -1,0 +1,150 @@
+// Gatehouse — Prisma Schema (v5)
+// Clean Architecture | Estate Management Backend
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum FeeType {
+  service_fee
+  levy
+}
+
+enum FeeFrequency {
+  monthly
+  quarterly
+  yearly
+  one_time
+}
+
+enum OccupantType {
+  owner
+  tenant
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Manager — Estate manager or treasurer
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Manager {
+  id             String    @id @default(uuid()) @db.Uuid
+  fullName       String
+  email          String    @unique
+  phone          String?
+  hashedPassword String
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  deletedAt      DateTime?
+
+  estates Estate[]
+
+  @@index([email])
+  @@index([id])
+  @@index([fullName])
+  @@map("managers")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Estate — Residential estate managed by a Manager
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Estate {
+  id        String    @id @default(uuid()) @db.Uuid
+  managerId String    @db.Uuid
+  name      String
+  address   String
+  city      String
+  state     String
+  units     Int       // total number of units
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  manager Manager @relation(fields: [managerId], references: [id])
+  fees    Fee[]
+  Unit    Unit[]
+
+  @@index([name])
+  @@index([id])
+  @@map("estates")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fee — Service charges and one-off levies for an estate
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Fee {
+  id        String       @id @default(uuid()) @db.Uuid
+  estateId  String       @db.Uuid
+  name      String
+  type      FeeType
+  amount    Decimal      @db.Decimal(12, 2)
+  frequency FeeFrequency
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+  deletedAt DateTime?
+
+  estate Estate @relation(fields: [estateId], references: [id])
+
+  @@index([id])
+  @@index([name])
+  @@index([type])
+  @@map("fees")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Unit — Individual units within an estate
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Unit {
+  id        String       @id @default(uuid()) @db.Uuid
+  estateId  String       @db.Uuid
+  block     String
+  unitName  String       // e.g. A1, B3
+  occupant  String
+  email     String
+  type      OccupantType // owner | tenant
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+  deletedAt DateTime?
+
+  estate  Estate   @relation(fields: [estateId], references: [id])
+  account Account?
+
+  @@index([id])
+  @@index([unitName])
+  @@index([email])
+  @@map("units")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Account — Virtual bank account from Nomba, linked to a Unit
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Account {
+  id            String    @id @default(uuid()) @db.Uuid
+  unitId        String    @unique @db.Uuid
+  accountNumber String
+  accountName   String    // e.g. Unit-A1
+  bankName      String
+  accountRef    String    @unique // Nomba accountRef used at creation
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  deletedAt     DateTime?
+
+  unit Unit @relation(fields: [unitId], references: [id])
+
+  @@index([id])
+  @@index([accountName])
+  @@index([accountNumber])
+  @@map("accounts")
+}
