@@ -39,16 +39,28 @@ async function bootstrap() {
   const config = new DocumentBuilder()
     .setTitle('🏘️ Gatehouse API')
     .setDescription(
-      'Estate management platform — Auth & Onboarding workflows powered by Nomba payments.',
+      'Estate management platform — Auth & Onboarding workflows powered by Nomba payments.\n\n' +
+      '**Production server:** https://gatehouse-backend-production.up.railway.app\n\n' +
+      'Authenticate via the **Authorize 🔒** button using a JWT token obtained from `POST /auth/login` or `POST /auth/register`.',
     )
     .setVersion('1.0.0')
+    // ── Servers: prod first so it's selected by default ──────────────────────
+    .addServer(
+      'https://gatehouse-backend-production.up.railway.app',
+      '🚀 Production (Railway)',
+    )
+    .addServer(
+      `http://localhost:${process.env.PORT ?? 3000}`,
+      '🛠️ Local Development',
+    )
+    // ── Auth scheme ───────────────────────────────────────────────────────────
     .addBearerAuth(
       {
         type: 'http',
         scheme: 'bearer',
         bearerFormat: 'JWT',
         name: 'Authorization',
-        description: 'Enter your JWT token',
+        description: 'Enter JWT obtained from /auth/login or /auth/register',
         in: 'header',
       },
       'JWT-auth',
