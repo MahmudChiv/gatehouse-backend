@@ -1,6 +1,7 @@
 import { Injectable, Logger, HttpException, HttpStatus } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Cron, CronExpression } from '@nestjs/schedule';
+import { createHmac, timingSafeEqual } from 'crypto';
 import axios from 'axios';
 
 interface TokenCache {
@@ -24,16 +25,24 @@ export class NombaService {
    */
   private fetchingToken: Promise<string> | null = null;
 
-  private readonly baseUrl: string;
-  private readonly accountId: string;
+  private readonly baseUrl: string; // version-less, e.g. https://sandbox.nomba.com
+  private readonly accountId: string; // parent accountId (sent as the `accountId` header)
+  private readonly subAccountId: string; // YOUR sub-account id (from Nomba); VAs are created under it
   private readonly clientId: string;
   private readonly clientSecret: string;
+  private readonly webhookSignatureKey: string;
 
   constructor(private readonly configService: ConfigService) {
-    this.baseUrl = this.configService.get<string>('NOMBA_BASE_URL', 'https://sandbox.nomba.com/v1');
+    // Normalise the base URL: Nomba endpoints live under different versions
+    // (/v1/auth, /v1/accounts, /v2/transfers), so strip any trailing version
+    // segment and add it per-endpoint instead.
+    const raw = this.configService.get<string>('NOMBA_BASE_URL', 'https://sandbox.nomba.com');
+    this.baseUrl = raw.replace(/\/(v\d+)?\/?$/i, '');
     this.accountId = this.configService.getOrThrow<string>('NOMBA_ACCOUNT_ID');
+    this.subAccountId = this.configService.get<string>('NOMBA_SUB_ACCOUNT_ID', '');
     this.clientId = this.configService.getOrThrow<string>('NOMBA_CLIENT_ID');
     this.clientSecret = this.configService.getOrThrow<string>('NOMBA_CLIENT_SECRET');
+    this.webhookSignatureKey = this.configService.get<string>('NOMBA_WEBHOOK_SIGNATURE_KEY', '');
   }
 
   // ─── Token Management ────────────────────────────────────────────────────
@@ -87,7 +96,7 @@ export class NombaService {
       this.logger.log('Fetching fresh Nomba access token...');
 
       const response = await axios.post(
-        `${this.baseUrl}/auth/token/issue`,
+        `${this.baseUrl}/v1/auth/token/issue`,
         {
           grant_type: 'client_credentials',
           client_id: this.clientId,
@@ -133,7 +142,10 @@ export class NombaService {
   // ─── Virtual Account Creation ─────────────────────────────────────────────
 
   /**
-   * Creates a permanent virtual account for a unit.
+   * Creates a permanent virtual account under YOUR sub-account, so inbound funds
+   * settle into your sub-account (not the parent/mothership). Uses
+   * POST /v1/accounts/virtual/{subAccountId} when NOMBA_SUB_ACCOUNT_ID is set
+   * (the hackathon pattern); falls back to the parent-level endpoint otherwise.
    * accountRef must be unique per call.
    */
   async createVirtualAccount(params: {
@@ -145,11 +157,16 @@ export class NombaService {
     try {
       this.logger.log(`Creating virtual account for: ${params.accountName}`);
 
+      const path = this.subAccountId
+        ? `/v1/accounts/virtual/${this.subAccountId}`
+        : `/v1/accounts/virtual`;
+
       const response = await axios.post(
-        `${this.baseUrl}/accounts/virtual`,
+        `${this.baseUrl}${path}`,
         {
           accountRef: params.accountRef,
           accountName: params.accountName,
+          currency: 'NGN',
           // No expiryDate → permanent account
         },
         {
@@ -198,6 +215,107 @@ export class NombaService {
         `Failed to create virtual account for ${params.accountName}`,
         HttpStatus.BAD_GATEWAY,
       );
+    }
+  }
+
+  // ─── Transfers / Payouts ──────────────────────────────────────────────────
+
+  /**
+   * Pays out to a vendor bank account via the Nomba Transfers API.
+   * `merchantTxRef` is the idempotency key and must be unique per payout.
+   */
+  async transferToBank(params: {
+    amountNaira: number;
+    accountNumber: string;
+    accountName: string;
+    bankCode: string;
+    merchantTxRef: string;
+    senderName?: string;
+    narration?: string;
+  }): Promise<{ id: string | null; status: string }> {
+    const token = await this.getAccessToken();
+    // Pay out FROM your sub-account (where collections settle) when configured,
+    // else from the parent account.
+    const path = this.subAccountId
+      ? `/v2/transfers/bank/${this.subAccountId}`
+      : `/v2/transfers/bank`;
+    try {
+      const response = await axios.post(
+        `${this.baseUrl}${path}`,
+        {
+          amount: params.amountNaira,
+          accountNumber: params.accountNumber,
+          accountName: params.accountName,
+          bankCode: params.bankCode,
+          merchantTxRef: params.merchantTxRef,
+          senderName: params.senderName,
+          narration: params.narration,
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            accountId: this.accountId,
+            'Content-Type': 'application/json',
+          },
+          timeout: 20000,
+        },
+      );
+      const data = response.data?.data ?? response.data;
+      return { id: data?.id ?? null, status: data?.status ?? 'PENDING' };
+    } catch (error: any) {
+      this.logger.error(
+        `Nomba transfer failed for ${params.merchantTxRef}`,
+        error?.response?.data ?? error?.message,
+      );
+      throw new HttpException('Failed to process payout via Nomba', HttpStatus.BAD_GATEWAY);
+    }
+  }
+
+  // ─── Transactions (verify / backfill) ─────────────────────────────────────
+
+  /** Fetches parent-account transactions, used to verify webhooks and backfill. */
+  async fetchTransactions(params?: { limit?: number; offset?: number }): Promise<any> {
+    const token = await this.getAccessToken();
+    const query = new URLSearchParams();
+    if (params?.limit) query.set('limit', String(params.limit));
+    if (params?.offset) query.set('offset', String(params.offset));
+    const suffix = query.toString() ? `?${query.toString()}` : '';
+    const response = await axios.get(`${this.baseUrl}/v1/transactions/accounts${suffix}`, {
+      headers: { Authorization: `Bearer ${token}`, accountId: this.accountId },
+      timeout: 20000,
+    });
+    return response.data?.data ?? response.data;
+  }
+
+  // ─── Webhook signature ────────────────────────────────────────────────────
+
+  /**
+   * Verifies a Nomba webhook. Nomba signs the colon-joined string
+   * event_type:requestId:userId:walletId:transactionId:type:time:responseCode:nomba-timestamp
+   * with HmacSHA256 using the dashboard signature key, delivered in `nomba-signature`.
+   */
+  verifyWebhookSignature(payload: any, signature: string, nombaTimestamp: string): boolean {
+    if (!this.webhookSignatureKey || !signature) return false;
+    const tx = payload?.data?.transaction ?? {};
+    const merchant = payload?.data?.merchant ?? {};
+    const signed = [
+      payload?.event_type,
+      payload?.requestId,
+      merchant?.userId,
+      merchant?.walletId,
+      tx?.transactionId,
+      tx?.type,
+      tx?.time,
+      tx?.responseCode,
+      nombaTimestamp,
+    ].join(':');
+    const expected = createHmac('sha256', this.webhookSignatureKey).update(signed).digest('hex');
+    try {
+      const a = Buffer.from(expected);
+      const b = Buffer.from(signature);
+      return a.length === b.length && timingSafeEqual(a, b);
+    } catch {
+      return false;
     }
   }
 

@@ -10,8 +10,9 @@ import { CreateEstateDto } from './dto/create-estate.dto';
 import { CreateFeeDto } from './dto/create-fee.dto';
 import { CreateUnitDto, OccupantType, UnitItemDto } from './dto/create-unit.dto';
 import { parse } from 'csv-parse/sync';
-import { randomUUID } from 'crypto';
+import { randomBytes, randomUUID } from 'crypto';
 import { FeeFrequency, FeeType } from '@prisma/client';
+import { nairaToKobo } from '../../common/money';
 
 @Injectable()
 export class OnboardingService {
@@ -92,7 +93,7 @@ export class OnboardingService {
         estateId: dto.estateId,
         name: fee.name,
         type: fee.type as FeeType,
-        amount: fee.amount,
+        amountKobo: nairaToKobo(fee.amount),
         frequency: fee.frequency as FeeFrequency,
       })),
     });
@@ -220,6 +221,11 @@ export class OnboardingService {
         bankName: nombaAccount.bankName,
         accountRef,
       },
+    });
+
+    // 4. Mint a tokenised resident statement link for the unit.
+    await this.prisma.residentLink.create({
+      data: { unitId: unit.id, token: randomBytes(16).toString('hex') },
     });
 
     this.logger.log(
