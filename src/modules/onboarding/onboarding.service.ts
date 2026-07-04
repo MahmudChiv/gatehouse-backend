@@ -56,6 +56,52 @@ export class OnboardingService {
     };
   }
 
+  // ─── Onboarding progress (resume after refresh) ────────────────────────────
+
+  async getState(managerId: string) {
+    const estate = await this.prisma.estate.findFirst({
+      where: { managerId, deletedAt: null },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    if (!estate) {
+      return {
+        message: 'OK',
+        data: { step: 1, estate: null, hasFees: false, hasUnits: false },
+      };
+    }
+
+    const [feeCount, unitCount] = await Promise.all([
+      this.prisma.fee.count({ where: { estateId: estate.id, deletedAt: null } }),
+      this.prisma.unit.count({ where: { estateId: estate.id, deletedAt: null } }),
+    ]);
+
+    const hasFees = feeCount > 0;
+    const hasUnits = unitCount > 0;
+
+    // Estate exists ⇒ resume at fees (step 3); the cosmetic Nomba step (2) has no
+    // persisted state, so we skip it on resume. Once units exist the manager is
+    // onboarded and the frontend guard sends them to the dashboard.
+    const step = hasFees && !hasUnits ? 4 : 3;
+
+    return {
+      message: 'OK',
+      data: {
+        step,
+        estate: {
+          id: estate.id,
+          name: estate.name,
+          address: estate.address,
+          city: estate.city,
+          state: estate.state,
+          units: estate.units,
+        },
+        hasFees,
+        hasUnits,
+      },
+    };
+  }
+
   // ─── Connect Nomba Account ─────────────────────────────────────────────────
 
   async connectNombaAccount() {
@@ -191,41 +237,49 @@ export class OnboardingService {
     estateId: string,
     item: UnitItemDto,
   ) {
-    // 1. Save unit to DB
-    const unit = await this.prisma.unit.create({
-      data: {
-        estateId,
-        block: item.block,
-        unitName: item.unitName,
-        occupant: item.occupant,
-        email: item.email,
-        type: item.type as any,
-      },
-    });
-
-    // 2. Create permanent virtual account on Nomba
+    // 1. Create the permanent virtual account on Nomba FIRST. If this fails we
+    //    throw before writing anything, so a unit is never persisted without its
+    //    account. Nomba rejects account names with special characters, so use the
+    //    sanitized unit label (no prefix).
     const accountRef = randomUUID();
-    const accountName = `Unit-${item.unitName}`;
+    const accountName = this.sanitizeAccountName(item.unitName) || 'Unit';
 
     const nombaAccount = await this.nombaService.createVirtualAccount({
       accountRef,
       accountName,
     });
 
-    // 3. Save account to DB
-    const account = await this.prisma.account.create({
-      data: {
-        unitId: unit.id,
-        accountNumber: nombaAccount.accountNumber,
-        accountName: nombaAccount.accountName,
-        bankName: nombaAccount.bankName,
-        accountRef,
-      },
-    });
+    // 2. Persist the unit, its account and its resident link atomically — either
+    //    all three land or none do.
+    const { unit, account } = await this.prisma.$transaction(async (tx) => {
+      const unit = await tx.unit.create({
+        data: {
+          estateId,
+          block: item.block,
+          unitName: item.unitName,
+          occupant: item.occupant,
+          phone: item.phone,
+          email: item.email,
+          type: item.type as any,
+        },
+      });
 
-    // 4. Mint a tokenised resident statement link for the unit.
-    await this.prisma.residentLink.create({
-      data: { unitId: unit.id, token: randomBytes(16).toString('hex') },
+      const account = await tx.account.create({
+        data: {
+          unitId: unit.id,
+          accountNumber: nombaAccount.accountNumber,
+          accountName: nombaAccount.accountName,
+          bankName: nombaAccount.bankName,
+          accountRef,
+        },
+      });
+
+      // Mint a tokenised resident statement link for the unit.
+      await tx.residentLink.create({
+        data: { unitId: unit.id, token: randomBytes(16).toString('hex') },
+      });
+
+      return { unit, account };
     });
 
     this.logger.log(
@@ -233,6 +287,15 @@ export class OnboardingService {
     );
 
     return { unit, account };
+  }
+
+  // Nomba rejects account names containing special characters, so keep only
+  // letters, digits and single spaces.
+  private sanitizeAccountName(raw: string): string {
+    return raw
+      .replace(/[^a-zA-Z0-9 ]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
   }
 
   private parseCsvToUnits(buffer: Buffer): UnitItemDto[] {
@@ -247,6 +310,7 @@ export class OnboardingService {
         const block = row['block'] || row['Block'];
         const unitName = row['unit_label'] || row['unitName'] || row['Unit Label'];
         const occupant = row['occupant_name'] || row['occupant'] || row['Occupant Name'];
+        const phone = row['phone'] || row['phone_number'] || row['Phone Number'] || undefined;
         const email = row['email'] || row['Email'];
         const typeRaw = (row['type'] || row['owner_or_tenant'] || row['Owner or Tenant'] || 'tenant').toLowerCase();
 
@@ -259,7 +323,7 @@ export class OnboardingService {
         const type: OccupantType =
           typeRaw === 'owner' ? OccupantType.OWNER : OccupantType.TENANT;
 
-        return { block, unitName, occupant, email, type };
+        return { block, unitName, occupant, phone, email, type };
       });
     } catch (err: any) {
       if (err instanceof BadRequestException) throw err;

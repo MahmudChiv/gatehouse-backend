@@ -17,6 +17,7 @@ import { BillingModule } from './modules/billing/billing.module';
 import { ExceptionsModule } from './modules/exceptions/exceptions.module';
 import { PayoutsModule } from './modules/payouts/payouts.module';
 import { StateModule } from './modules/state/state.module';
+import { GroupsModule } from './modules/groups/groups.module';
 import { PublicModule } from './modules/public/public.module';
 import { ReportsModule } from './modules/reports/reports.module';
 
@@ -45,6 +46,7 @@ import { ReportsModule } from './modules/reports/reports.module';
     ExceptionsModule,
     PayoutsModule,
     StateModule,
+    GroupsModule,
     PublicModule,
     ReportsModule,
   ],

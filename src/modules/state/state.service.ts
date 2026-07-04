@@ -47,7 +47,7 @@ export class StateService {
   async getEstateState(estateId: string): Promise<State> {
     const estate = await this.prisma.estate.findUniqueOrThrow({ where: { id: estateId } });
 
-    const [units, payments, vendors, payouts, billingRuns, levies, activity] = await Promise.all([
+    const [units, payments, vendors, payouts, billingRuns, levies, activity, groups] = await Promise.all([
       this.prisma.unit.findMany({
         where: { estateId, deletedAt: null },
         include: { account: true, charges: true, creditEntries: true },
@@ -71,6 +71,7 @@ export class StateService {
         include: { charges: { select: { originalAmountKobo: true, outstandingKobo: true } } },
       }),
       this.prisma.activity.findMany({ where: { estateId }, orderBy: { createdAt: 'desc' }, take: 50 }),
+      this.prisma.unitGroup.findMany({ where: { estateId }, orderBy: { createdAt: 'asc' } }),
     ]);
 
     type PaymentRow = (typeof payments)[number];
@@ -101,6 +102,7 @@ export class StateService {
         id: u.id,
         label: u.unitName,
         block: u.block,
+        groupId: u.groupId ?? null,
         occupant: u.occupant,
         phone: u.email,
         accountNumber: u.account?.accountNumber ?? '—',
@@ -202,6 +204,7 @@ export class StateService {
         message: a.message,
         unitId: a.unitId ?? undefined,
       })),
+      groups: groups.map((g) => ({ id: g.id, name: g.name })),
       recentlyChanged: {},
     };
   }

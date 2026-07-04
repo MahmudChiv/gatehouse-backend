@@ -126,6 +126,7 @@ model Estate {
   manager     Manager      @relation(fields: [managerId], references: [id])
   fees        Fee[]
   Unit        Unit[]
+  unitGroups  UnitGroup[]
   billingRuns BillingRun[]
   payments    Payment[]
   vendors     Vendor[]
@@ -171,8 +172,10 @@ model Unit {
   id                String       @id @default(uuid()) @db.Uuid
   estateId          String       @db.Uuid
   block             String
+  groupId           String?      @db.Uuid // user-defined group; null = ungrouped
   unitName          String // e.g. A1, B3
   occupant          String
+  phone             String?
   email             String
   type              OccupantType // owner | tenant
   balanceKobo       Int          @default(0)
@@ -184,6 +187,7 @@ model Unit {
   deletedAt         DateTime?
 
   estate        Estate        @relation(fields: [estateId], references: [id])
+  group         UnitGroup?    @relation(fields: [groupId], references: [id])
   account       Account?
   charges       Charge[]
   payments      Payment[]
@@ -193,7 +197,28 @@ model Unit {
   @@index([id])
   @@index([unitName])
   @@index([email])
+  @@index([groupId])
   @@map("units")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UnitGroup — a manager-defined grouping of units (replaces the fixed A/B/C/D
+// blocks in the UI). A unit belongs to at most one group; deleting a group
+// reverts its units to ungrouped (groupId → null) via the default SetNull.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model UnitGroup {
+  id        String   @id @default(uuid()) @db.Uuid
+  estateId  String   @db.Uuid
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  estate Estate @relation(fields: [estateId], references: [id])
+  units  Unit[]
+
+  @@index([estateId])
+  @@map("unit_groups")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

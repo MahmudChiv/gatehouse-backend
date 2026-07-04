@@ -30,6 +30,7 @@ export interface Unit {
   id: string;
   label: string;
   block: string;
+  groupId: string | null;
   occupant: string;
   phone: string;
   accountNumber: string;
@@ -86,6 +87,11 @@ export interface ActivityItem {
   unitId?: string;
 }
 
+export interface GroupView {
+  id: string;
+  name: string;
+}
+
 export interface BillingRunView {
   id: string;
   cycle: string;
@@ -119,5 +125,6 @@ export interface State {
   billingRuns: BillingRunView[];
   levies: LevyView[];
   activity: ActivityItem[];
+  groups: GroupView[];
   recentlyChanged: Record<string, number>;
 }
