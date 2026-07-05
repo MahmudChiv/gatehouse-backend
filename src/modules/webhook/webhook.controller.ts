@@ -28,14 +28,26 @@ export class WebhookController {
     @Headers('nomba-signature') signature: string,
     @Headers('nomba-timestamp') nombaTimestamp: string,
   ) {
-    if (!this.nomba.verifyWebhookSignature(payload, signature, nombaTimestamp)) {
+    // TEMP debug: dump the raw payload + headers before verification so we can
+    // see the real Nomba shape even if the signature check fails. Remove once
+    // the transaction/reversal field shapes are confirmed.
+    this.logger.log(`🔔 Nomba webhook received:\n${JSON.stringify(payload, null, 2)}`);
+    const verified = this.nomba.verifyWebhookSignature(payload, signature, nombaTimestamp);
+    this.logger.log(
+      `Signature check: ${verified ? 'PASS' : 'FAIL'} (sig=${signature ? 'present' : 'missing'}, ts=${nombaTimestamp ?? 'missing'})`,
+    );
+    if (!verified) {
       throw new UnauthorizedException('Invalid signature');
     }
     try {
       await this.dispatch(payload);
     } catch (err) {
-      // Acknowledge anyway so Nomba doesn't hammer retries; the error is logged.
-      this.logger.error('Webhook processing error', err as Error);
+      // Surface the failure as a 500 so Nomba redelivers. The ingest path is
+      // idempotent on transactionId, so a retry can never double-credit.
+      // Permanent problems (malformed/absent data) are handled inside dispatch by
+      // returning early rather than throwing, so they don't trigger a retry loop.
+      this.logger.error('Webhook processing failed — returning 500 for Nomba retry', err as Error);
+      throw err;
     }
     return { received: true };
   }
@@ -46,16 +58,36 @@ export class WebhookController {
 
     if (eventType === 'payment_success') {
       const customer = payload?.data?.customer ?? {};
+      const amountNaira = Number(tx.transactionAmount);
+      if (!tx.transactionId || !Number.isFinite(amountNaira) || amountNaira <= 0) {
+        // Correctly signed but unusable — drop it instead of retrying forever.
+        this.logger.warn(
+          `Ignoring payment_success with invalid ref/amount: ref=${tx.transactionId} amount=${tx.transactionAmount}`,
+        );
+        return;
+      }
       await this.payments.ingestInboundPayment({
         nombaTxnRef: tx.transactionId,
         accountRef: tx.aliasAccountReference ?? null,
         accountNumber: tx.aliasAccountNumber ?? null,
-        amountKobo: nairaToKobo(Number(tx.transactionAmount)),
+        amountKobo: nairaToKobo(amountNaira),
         sourceName: customer.senderName ?? 'Unknown sender',
         sourceAccount: customer.accountNumber ?? null,
         receivedAt: tx.time ? new Date(tx.time).getTime() : Date.now(),
         rawPayload: payload,
       });
+      return;
+    }
+
+    if (eventType === 'payment_reversal') {
+      // The field linking a reversal to its original payment is unverified — try
+      // the likely candidates; reverseInboundPayment logs if none match.
+      await this.payments.reverseInboundPayment([
+        tx.originalTransactionId,
+        tx.parentTransactionId,
+        tx.transactionId,
+        tx.merchantTxRef,
+      ]);
       return;
     }
 
@@ -76,7 +108,7 @@ export class WebhookController {
       return;
     }
 
-    // payment_failed / payment_reversal — logged; extend as needed.
+    // payment_failed — the payment never settled, so there's nothing to undo.
     this.logger.log(`Unhandled webhook event_type=${eventType}`);
   }
 }

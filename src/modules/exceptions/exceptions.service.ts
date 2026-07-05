@@ -13,7 +13,8 @@ export type ResolveAction =
   | 'duplicate-hold'
   | 'duplicate-keep'
   | 'reassign'
-  | 'attribute';
+  | 'attribute'
+  | 'acknowledge';
 
 @Injectable()
 export class ExceptionsService {
@@ -70,6 +71,12 @@ export class ExceptionsService {
             await this.applyPaymentToUnit(tx, payment.id, payment.unitId, payment.grossAmountKobo, payment.sourceName, 'Paid on behalf');
             message = 'Attributed and tagged as paid on behalf';
           }
+          break;
+        }
+        case 'REVERSAL': {
+          // Manual-review policy: the ledger is not auto-unwound. The manager
+          // adjusts the unit by hand, then acknowledges to clear the flag.
+          message = 'Reversal acknowledged';
           break;
         }
       }

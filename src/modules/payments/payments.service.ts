@@ -1,10 +1,12 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
+import { Cron, CronExpression } from '@nestjs/schedule';
 import { randomUUID } from 'crypto';
 import { Prisma, PaymentStatus, ExceptionType } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ReconciliationService } from '../reconciliation/reconciliation.service';
 import { RealtimeService } from '../realtime/realtime.service';
 import { NotifierService } from '../notifier/notifier.service';
+import { NombaService } from '../nomba/nomba.service';
 import type { ReconResult } from '../reconciliation/reconciliation';
 import { applyReconEffects } from './apply';
 import { chargeKind } from '../../common/domain';
@@ -32,12 +34,123 @@ export interface IngestResult {
 
 @Injectable()
 export class PaymentsService {
+  private readonly logger = new Logger(PaymentsService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly recon: ReconciliationService,
     private readonly realtime: RealtimeService,
     private readonly notifier: NotifierService,
+    private readonly nomba: NombaService,
   ) {}
+
+  /**
+   * Safety net for dropped or retry-exhausted webhooks: periodically pull recent
+   * Nomba sub-account transactions and re-ingest any inbound virtual-account credit
+   * we don't already have. Safe to run repeatedly — `ingestInboundPayment` dedupes on
+   * nombaTxnRef, and a secondary unit+amount+window check blocks a double-credit when
+   * the webhook already booked the same transfer under a different ref.
+   *
+   * Only `entryType === 'CREDIT'` + `status === 'SUCCESS'` records are ingested, so
+   * outbound payouts (DEBIT), refunds and pending rows are never booked as payments.
+   * An inbound credit's receiving VA is `virtualAccountReference` (== Account.accountRef).
+   */
+  @Cron(CronExpression.EVERY_10_MINUTES)
+  async backfillMissedPayments(): Promise<void> {
+    const dateTo = new Date();
+    const dateFrom = new Date(dateTo.getTime() - 60 * 60_000); // last hour
+
+    let cursor: string | undefined;
+    let fetched = 0;
+    let matched = 0;
+    let ingested = 0;
+
+    try {
+      do {
+        const page = await this.nomba.fetchSubAccountTransactions({
+          limit: 50,
+          cursor,
+          dateFrom: dateFrom.toISOString(),
+          dateTo: dateTo.toISOString(),
+        });
+        for (const it of page.results) {
+          fetched++;
+
+          // Inbound, settled virtual-account credits only — never a payout (DEBIT),
+          // refund, or pending row.
+          if (it?.entryType !== 'CREDIT' || it?.status !== 'SUCCESS') continue;
+
+          const ref: string | undefined = it?.id ?? it?.transactionId;
+          const amountNaira = Number(it?.amount);
+          if (!ref || !Number.isFinite(amountNaira) || amountNaira <= 0) continue;
+
+          const accountRef: string | null = it?.virtualAccountReference ?? null;
+          const accountNumber: string | null = it?.recipientAccountNumber ?? null;
+          const accountInclude = {
+            unit: { select: { id: true, estate: { select: { duplicateWindowSecs: true } } } },
+          } as const;
+          const account = accountRef
+            ? await this.prisma.account.findUnique({ where: { accountRef }, include: accountInclude })
+            : accountNumber
+              ? await this.prisma.account.findFirst({ where: { accountNumber }, include: accountInclude })
+              : null;
+          if (!account) continue;
+          matched++;
+
+          const amountKobo = nairaToKobo(amountNaira);
+          const receivedAtMs = it?.timeCreated ? new Date(it.timeCreated).getTime() : Date.now();
+
+          // Exact idempotency on the transaction id.
+          const existing = await this.prisma.payment.findUnique({ where: { nombaTxnRef: ref } });
+          if (existing) continue;
+
+          // Secondary dedupe: the webhook may have already booked this same credit
+          // under a different ref — skip if a payment for this unit + amount landed
+          // within the estate's duplicate window.
+          const windowMs = account.unit.estate.duplicateWindowSecs * 1000;
+          const alreadyBooked = await this.prisma.payment.findFirst({
+            where: {
+              unitId: account.unit.id,
+              grossAmountKobo: amountKobo,
+              receivedAt: {
+                gte: new Date(receivedAtMs - windowMs),
+                lte: new Date(receivedAtMs + windowMs),
+              },
+            },
+          });
+          if (alreadyBooked) continue;
+
+          try {
+            const res = await this.ingestInboundPayment({
+              nombaTxnRef: ref,
+              accountRef,
+              accountNumber,
+              amountKobo,
+              sourceName: it?.senderName ?? it?.ktaSenderName ?? 'Unknown sender',
+              sourceAccount: it?.ktaSenderAccountNumber ?? null,
+              receivedAt: receivedAtMs,
+              rawPayload: { channel: 'backfill', item: it },
+            });
+            if (!res.deduped) ingested++;
+          } catch (err) {
+            this.logger.error(`Backfill: failed to ingest txn ${ref}`, err as Error);
+          }
+        }
+        cursor = page.cursor || undefined;
+      } while (cursor);
+    } catch (err) {
+      this.logger.error('Backfill: failed to fetch/process Nomba transactions', err as Error);
+      return;
+    }
+
+    if (fetched === 0 || matched === 0) {
+      this.logger.warn(
+        `Backfill: fetched ${fetched} txns, matched ${matched} credits to our accounts — verify fetchSubAccountTransactions shape if this stays 0`,
+      );
+    } else {
+      this.logger.log(`Backfill: fetched ${fetched}, matched ${matched}, newly ingested ${ingested}`);
+    }
+  }
 
   /** The single inbound-payment path: dedupe → reconcile → persist → broadcast. */
   async ingestInboundPayment(input: InboundPayment): Promise<IngestResult> {
@@ -144,6 +257,57 @@ export class PaymentsService {
       status: this.mapStatus(result, input.status),
       exceptionType: result.exceptionType as ExceptionType | undefined,
     };
+  }
+
+  /**
+   * Inbound payment reversal — Nomba clawed back a settled transfer.
+   *
+   * Policy: flag for manual review, do NOT auto-unwind the ledger. The credit
+   * from the original payment may already have been spent on a later charge, so
+   * an automatic reversal could leave the unit in an inconsistent state. Instead
+   * we mark the payment REVERSED and raise a REVERSAL exception for a manager.
+   *
+   * `candidateRefs` are the possible references to the ORIGINAL payment; the exact
+   * field Nomba uses to link a reversal to its origin is unverified, so we try
+   * several. Returns { reversed: false } (logged, not thrown) when none match.
+   */
+  async reverseInboundPayment(candidateRefs: (string | null | undefined)[]): Promise<{ reversed: boolean }> {
+    const refs = candidateRefs.filter((r): r is string => !!r);
+    const original = refs.length
+      ? await this.prisma.payment.findFirst({ where: { nombaTxnRef: { in: refs } } })
+      : null;
+
+    if (!original) {
+      this.logger.warn(`Reversal received but no matching original payment for refs=[${refs.join(', ')}]`);
+      return { reversed: false };
+    }
+    if (original.status === PaymentStatus.REVERSED) return { reversed: true }; // idempotent
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.payment.update({ where: { id: original.id }, data: { status: PaymentStatus.REVERSED } });
+      // Exception.paymentId is unique — only attach one if the payment doesn't
+      // already carry an (unresolved) exception from its original reconciliation.
+      const existing = await tx.exception.findUnique({ where: { paymentId: original.id } });
+      if (!existing) {
+        await tx.exception.create({
+          data: {
+            paymentId: original.id,
+            type: ExceptionType.REVERSAL,
+            suggestion: `Payment of ${formatNaira(original.grossAmountKobo)} from ${original.sourceName} was reversed by Nomba — review and adjust the unit's balance.`,
+          },
+        });
+      }
+      await tx.activity.create({
+        data: {
+          estateId: original.estateId,
+          unitId: original.unitId,
+          message: `Payment from ${original.sourceName} reversed — unit balance needs review`,
+        },
+      });
+    });
+
+    this.realtime.broadcast(original.estateId, 'payment');
+    return { reversed: true };
   }
 
   /** Manual/cash entry — same path, flagged MANUAL. */

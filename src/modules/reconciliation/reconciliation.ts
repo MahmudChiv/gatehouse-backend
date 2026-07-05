@@ -9,6 +9,7 @@
  * enforced by the ingest handler before this function is ever called; this module
  * is concerned purely with *how* a payment is allocated.
  */
+import { formatNaira } from '../../common/money';
 
 export type AllocationRule = 'OLDEST_FIRST' | 'DUES_FIRST';
 export type ChargeKind = 'SERVICE_CHARGE' | 'LEVY';
@@ -237,7 +238,7 @@ export function reconcile(input: ReconInput): ReconResult {
         newCreditBalanceKobo: remainingCredit, // surplus NOT yet credited
         isException: true,
         exceptionType: 'OVERPAYMENT',
-        suggestion: `Overpayment of ${surplus} kobo beyond outstanding — move to credit or flag for refund.`,
+        suggestion: `Overpayment of ${formatNaira(surplus)} beyond outstanding — move to credit or flag for refund.`,
       };
     }
     // Auto-credit the surplus (default behaviour).

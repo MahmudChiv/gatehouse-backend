@@ -195,7 +195,7 @@ export class OnboardingService {
     // ── Create units + virtual accounts concurrently ───────────────────────
     const results = await Promise.allSettled(
       unitItems.map((item) =>
-        this.createSingleUnitWithAccount(dto.estateId, item),
+        this.createSingleUnitWithAccount(dto.estateId, estate.name, item),
       ),
     );
 
@@ -217,6 +217,16 @@ export class OnboardingService {
       `Unit onboarding complete: ${succeeded.length} succeeded, ${failed.length} failed`,
     );
 
+    // Every unit failed ⇒ nothing was persisted. Returning the usual 201 here would
+    // tell the client the units were created when they weren't, so fail loud instead.
+    if (succeeded.length === 0) {
+      throw new BadRequestException(
+        `No units were created. ${failed
+          .map((f) => `${f.unit}: ${f.reason}`)
+          .join('; ')}`,
+      );
+    }
+
     return {
       message: `Onboarding complete: ${succeeded.length} unit(s) created, ${failed.length} failed`,
       data: {
@@ -235,14 +245,16 @@ export class OnboardingService {
 
   private async createSingleUnitWithAccount(
     estateId: string,
+    estateName: string,
     item: UnitItemDto,
   ) {
     // 1. Create the permanent virtual account on Nomba FIRST. If this fails we
     //    throw before writing anything, so a unit is never persisted without its
-    //    account. Nomba rejects account names with special characters, so use the
-    //    sanitized unit label (no prefix).
+    //    account. Nomba's account name is the "account holder's name": letters
+    //    only (no digits or symbols) and 8–64 chars, so we build it from the
+    //    occupant name — a unit label like "A1" or "2 bed" fails both rules.
     const accountRef = randomUUID();
-    const accountName = this.sanitizeAccountName(item.unitName) || 'Unit';
+    const accountName = this.buildAccountName(item.occupant, estateName);
 
     const nombaAccount = await this.nombaService.createVirtualAccount({
       accountRef,
@@ -289,13 +301,19 @@ export class OnboardingService {
     return { unit, account };
   }
 
-  // Nomba rejects account names containing special characters, so keep only
-  // letters, digits and single spaces.
-  private sanitizeAccountName(raw: string): string {
-    return raw
-      .replace(/[^a-zA-Z0-9 ]+/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
+  // Build a Nomba-valid account holder name: letters and single spaces only
+  // (Nomba rejects digits and symbols) and 8–64 chars. Short occupant names are
+  // padded with the estate name, then a generic suffix, so the request is never
+  // rejected on length.
+  private buildAccountName(occupant: string, estateName: string): string {
+    const lettersOnly = (s: string) =>
+      s.replace(/[^a-zA-Z ]+/g, ' ').replace(/\s+/g, ' ').trim();
+
+    let name = lettersOnly(occupant);
+    if (name.length < 8) name = lettersOnly(`${name} ${estateName}`);
+    if (name.length < 8) name = lettersOnly(`${name} Resident`);
+
+    return name.slice(0, 64).trim();
   }
 
   private parseCsvToUnits(buffer: Buffer): UnitItemDto[] {

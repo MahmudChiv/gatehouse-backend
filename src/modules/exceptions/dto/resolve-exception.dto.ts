@@ -1,7 +1,7 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { IsIn, IsOptional, IsString, IsUUID } from 'class-validator';
 
-const ACTIONS = ['credit', 'refund', 'duplicate-hold', 'duplicate-keep', 'reassign', 'attribute'] as const;
+const ACTIONS = ['credit', 'refund', 'duplicate-hold', 'duplicate-keep', 'reassign', 'attribute', 'acknowledge'] as const;
 
 export class ResolveExceptionDto {
   @ApiProperty({ enum: ACTIONS })

@@ -18,6 +18,7 @@ import { ExceptionsModule } from './modules/exceptions/exceptions.module';
 import { PayoutsModule } from './modules/payouts/payouts.module';
 import { StateModule } from './modules/state/state.module';
 import { GroupsModule } from './modules/groups/groups.module';
+import { UnitsModule } from './modules/units/units.module';
 import { PublicModule } from './modules/public/public.module';
 import { ReportsModule } from './modules/reports/reports.module';
 
@@ -47,6 +48,7 @@ import { ReportsModule } from './modules/reports/reports.module';
     PayoutsModule,
     StateModule,
     GroupsModule,
+    UnitsModule,
     PublicModule,
     ReportsModule,
   ],

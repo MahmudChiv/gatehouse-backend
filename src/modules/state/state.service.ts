@@ -25,12 +25,14 @@ const paymentStatusMap: Record<string, PaymentStatus> = {
   OVERPAYMENT: 'overpayment',
   EXCEPTION: 'exception',
   MANUAL: 'manual',
+  REVERSED: 'reversed',
 };
 const exceptionTypeMap: Record<string, ExceptionType> = {
   OVERPAYMENT: 'overpayment',
   DUPLICATE: 'duplicate',
   MISDIRECTED: 'misdirected',
   THIRD_PARTY: 'third_party',
+  REVERSAL: 'reversal',
 };
 
 @Injectable()
@@ -47,7 +49,7 @@ export class StateService {
   async getEstateState(estateId: string): Promise<State> {
     const estate = await this.prisma.estate.findUniqueOrThrow({ where: { id: estateId } });
 
-    const [units, payments, vendors, payouts, billingRuns, levies, activity, groups] = await Promise.all([
+    const [units, payments, vendors, payouts, billingRuns, levies, activity, groups, allVendorNames] = await Promise.all([
       this.prisma.unit.findMany({
         where: { estateId, deletedAt: null },
         include: { account: true, charges: true, creditEntries: true },
@@ -72,7 +74,11 @@ export class StateService {
       }),
       this.prisma.activity.findMany({ where: { estateId }, orderBy: { createdAt: 'desc' }, take: 50 }),
       this.prisma.unitGroup.findMany({ where: { estateId }, orderBy: { createdAt: 'asc' } }),
+      // Names for ALL vendors (including soft-deleted) so payout history can label a
+      // payout even after its vendor is removed from the active list.
+      this.prisma.vendor.findMany({ where: { estateId }, select: { id: true, name: true } }),
     ]);
+    const vendorNameById = new Map(allVendorNames.map((v) => [v.id, v.name]));
 
     type PaymentRow = (typeof payments)[number];
     const paymentsByUnit = new Map<string, PaymentRow[]>();
@@ -104,7 +110,8 @@ export class StateService {
         block: u.block,
         groupId: u.groupId ?? null,
         occupant: u.occupant,
-        phone: u.email,
+        phone: u.phone ?? '',
+        email: u.email,
         accountNumber: u.account?.accountNumber ?? '—',
         occupantType: u.type === 'owner' ? 'owner' : 'tenant',
         balance: koboToNaira(u.balanceKobo),
@@ -160,12 +167,14 @@ export class StateService {
         name: v.name,
         category: v.category,
         bank: v.bankName,
+        bankCode: v.bankCode ?? '',
         account: v.accountNumber,
         totalPaid: koboToNaira(payoutTotalByVendor.get(v.id) ?? 0),
       })),
       payouts: payouts.map((po) => ({
         id: po.id,
         vendorId: po.vendorId,
+        vendorName: vendorNameById.get(po.vendorId) ?? 'Removed vendor',
         amount: koboToNaira(po.amountKobo),
         note: po.note,
         date: po.createdAt.getTime(),
@@ -212,7 +221,7 @@ export class StateService {
   // running balance == original charges − allocated payments (incl. credit applied) at every row (PRD §8).
   private buildLedger(
     unitId: string,
-    charges: { id: string; description: string; originalAmountKobo: number; createdAt: Date }[],
+    charges: { id: string; description: string; originalAmountKobo: number; outstandingKobo: number; createdAt: Date }[],
     creditEntries: { id: string; amountKobo: number; reason: string; createdAt: Date }[],
     payments: { receivedAt: Date; tag: string | null; allocations: { amountKobo: number }[] }[],
     cycle: string,
@@ -225,11 +234,14 @@ export class StateService {
       affects: boolean;
       allocation?: string;
       order: number;
+      settled?: 'paid' | 'partial' | 'unpaid';
     }
     const evs: Ev[] = [];
 
     for (const c of charges) {
-      evs.push({ date: c.createdAt.getTime(), description: c.description, kind: 'charge', amount: koboToNaira(c.originalAmountKobo), affects: true, order: 0 });
+      const settled: 'paid' | 'partial' | 'unpaid' =
+        c.outstandingKobo <= 0 ? 'paid' : c.outstandingKobo >= c.originalAmountKobo ? 'unpaid' : 'partial';
+      evs.push({ date: c.createdAt.getTime(), description: c.description, kind: 'charge', amount: koboToNaira(c.originalAmountKobo), affects: true, order: 0, settled });
     }
     for (const p of payments) {
       const applied = p.allocations.reduce((a, x) => a + x.amountKobo, 0);
@@ -256,7 +268,7 @@ export class StateService {
     let running = 0;
     return evs.map((e, i) => {
       if (e.affects) running += e.amount;
-      return { id: `${unitId}-le-${i}`, date: e.date, description: e.description, kind: e.kind, amount: e.amount, running, allocation: e.allocation };
+      return { id: `${unitId}-le-${i}`, date: e.date, description: e.description, kind: e.kind, amount: e.amount, running, allocation: e.allocation, settled: e.settled };
     });
   }
 }

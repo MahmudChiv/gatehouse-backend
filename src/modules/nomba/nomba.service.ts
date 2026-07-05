@@ -271,20 +271,172 @@ export class NombaService {
     }
   }
 
+  // ─── Bank list ────────────────────────────────────────────────────────────
+
+  /**
+   * Lists the banks Nomba can transfer to. Each `code` is what the account lookup
+   * and payout endpoints expect as `bankCode`. GET /v1/transfers/banks nests the
+   * banks under `data` — which the sandbox returns as the array itself (the docs
+   * show `data.results[]`), so we handle both — each entry being { code, name }.
+   */
+  async listBanks(): Promise<{ name: string; code: string }[]> {
+    const token = await this.getAccessToken();
+    try {
+      const response = await axios.get(`${this.baseUrl}/v1/transfers/banks`, {
+        headers: { Authorization: `Bearer ${token}`, accountId: this.accountId },
+        timeout: 15000,
+      });
+      const body = response.data?.data ?? response.data;
+      const results = Array.isArray(body) ? body : (body?.results ?? []);
+      return results
+        .map((b: any) => ({ name: b.name ?? b.bankName, code: b.code ?? b.bankCode }))
+        .filter((b: { name?: string; code?: string }) => b.name && b.code);
+    } catch (error: any) {
+      const detail = error?.response
+        ? `HTTP ${error.response.status}: ${JSON.stringify(error.response.data)}`
+        : error?.message;
+      this.logger.error(`Failed to fetch Nomba bank list — ${detail}`);
+      throw new HttpException('Could not load bank list', HttpStatus.BAD_GATEWAY);
+    }
+  }
+
+  // ─── Account name lookup (name enquiry) ───────────────────────────────────
+
+  /**
+   * Resolves the registered account-holder name for a bank account, so a manager
+   * can confirm a vendor's details before saving or paying. Wraps Nomba's
+   * POST /v1/transfers/bank/lookup (accountNumber + bankCode). Throws BAD_GATEWAY
+   * when Nomba can't verify, so the caller surfaces "couldn't verify" rather than
+   * storing an unchecked name.
+   */
+  async resolveAccountName(params: {
+    accountNumber: string;
+    bankCode: string;
+  }): Promise<{ accountName: string }> {
+    const token = await this.getAccessToken();
+    try {
+      const response = await axios.post(
+        `${this.baseUrl}/v1/transfers/bank/lookup`,
+        { accountNumber: params.accountNumber, bankCode: params.bankCode },
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            accountId: this.accountId,
+            'Content-Type': 'application/json',
+          },
+          timeout: 15000,
+        },
+      );
+      const data = response.data?.data ?? response.data;
+      const accountName = data?.accountName ?? data?.account_name;
+      if (!accountName) {
+        this.logger.error(
+          `Nomba account lookup returned no name: ${JSON.stringify(response.data)}`,
+        );
+        throw new Error('no accountName in Nomba lookup response');
+      }
+      return { accountName };
+    } catch (error: any) {
+      const detail = error?.response
+        ? `HTTP ${error.response.status}: ${JSON.stringify(error.response.data)}`
+        : error?.message;
+      this.logger.error(`Nomba account lookup failed — ${detail}`);
+      throw new HttpException(
+        'Could not verify account — check the number and bank and try again',
+        HttpStatus.BAD_GATEWAY,
+      );
+    }
+  }
+
   // ─── Transactions (verify / backfill) ─────────────────────────────────────
 
-  /** Fetches parent-account transactions, used to verify webhooks and backfill. */
-  async fetchTransactions(params?: { limit?: number; offset?: number }): Promise<any> {
+  /**
+   * Lists transactions for YOUR sub-account (where unit virtual accounts settle),
+   * used to poll for inbound payments the webhook may have missed. Cursor-based:
+   * pass the returned `cursor` back on the next call to page forward until it is
+   * empty. Ref: GET /v1/transactions/accounts/{subAccountId}.
+   */
+  async fetchSubAccountTransactions(params?: {
+    limit?: number;
+    cursor?: string;
+    dateFrom?: string; // ISO 8601 UTC, e.g. 2026-07-05T00:00:00.000Z
+    dateTo?: string; // ISO 8601 UTC
+  }): Promise<{ results: any[]; cursor: string }> {
+    if (!this.subAccountId) {
+      throw new HttpException('NOMBA_SUB_ACCOUNT_ID is not configured', HttpStatus.PRECONDITION_FAILED);
+    }
     const token = await this.getAccessToken();
     const query = new URLSearchParams();
     if (params?.limit) query.set('limit', String(params.limit));
-    if (params?.offset) query.set('offset', String(params.offset));
+    if (params?.cursor) query.set('cursor', params.cursor);
+    if (params?.dateFrom) query.set('dateFrom', params.dateFrom);
+    if (params?.dateTo) query.set('dateTo', params.dateTo);
     const suffix = query.toString() ? `?${query.toString()}` : '';
-    const response = await axios.get(`${this.baseUrl}/v1/transactions/accounts${suffix}`, {
-      headers: { Authorization: `Bearer ${token}`, accountId: this.accountId },
-      timeout: 20000,
-    });
-    return response.data?.data ?? response.data;
+    const response = await axios.get(
+      `${this.baseUrl}/v1/transactions/accounts/${this.subAccountId}${suffix}`,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          accountId: this.accountId,
+        },
+        timeout: 20000,
+      },
+    );
+    const data = response.data?.data ?? {};
+    return { results: data.results ?? [], cursor: data.cursor ?? '' };
+  }
+
+  // ─── Sub-account balance ──────────────────────────────────────────────────
+
+  /**
+   * Live balance of YOUR Nomba sub-account (the settlement account VAs are
+   * created under and payouts leave from). This is the whole float, not a
+   * per-estate figure. GET /v1/accounts/{subAccountId}/balance returns the
+   * amount as a naira string (e.g. "281946.0").
+   *
+   * Soft-fails to `{ available: false }` (not configured / Nomba error) so the
+   * balance widget degrades gracefully instead of breaking the dashboard.
+   */
+  async fetchSubAccountBalance(): Promise<{
+    available: boolean;
+    amountNaira?: number;
+    currency?: string;
+    asOf?: number;
+  }> {
+    if (!this.subAccountId) {
+      this.logger.warn('Sub-account balance requested but NOMBA_SUB_ACCOUNT_ID is not set');
+      return { available: false };
+    }
+    try {
+      const token = await this.getAccessToken();
+      const response = await axios.get(
+        `${this.baseUrl}/v1/accounts/${this.subAccountId}/balance`,
+        {
+          headers: { Authorization: `Bearer ${token}`, accountId: this.accountId },
+          timeout: 15000,
+        },
+      );
+      const data = response.data?.data ?? response.data;
+      const amountNaira = Number(data?.amount);
+      if (!Number.isFinite(amountNaira)) {
+        this.logger.error(
+          `Nomba balance response missing a numeric amount: ${JSON.stringify(response.data)}`,
+        );
+        return { available: false };
+      }
+      return {
+        available: true,
+        amountNaira,
+        currency: data?.currency ?? 'NGN',
+        asOf: data?.timeCreated ? new Date(data.timeCreated).getTime() : Date.now(),
+      };
+    } catch (error: any) {
+      const detail = error?.response
+        ? `HTTP ${error.response.status}: ${JSON.stringify(error.response.data)}`
+        : error?.message;
+      this.logger.error(`Failed to fetch Nomba sub-account balance — ${detail}`);
+      return { available: false };
+    }
   }
 
   // ─── Webhook signature ────────────────────────────────────────────────────

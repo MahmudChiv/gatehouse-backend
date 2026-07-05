@@ -60,6 +60,7 @@ enum PaymentStatus {
   OVERPAYMENT
   EXCEPTION
   MANUAL
+  REVERSED
 }
 
 enum ExceptionType {
@@ -67,6 +68,7 @@ enum ExceptionType {
   DUPLICATE
   MISDIRECTED
   THIRD_PARTY
+  REVERSAL
 }
 
 enum ExceptionStatus {

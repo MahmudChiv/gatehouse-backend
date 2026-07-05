@@ -2,8 +2,8 @@
 // src/lib/types.ts so GET /estate/:id/state feeds the existing UI unchanged.
 
 export type UnitStatus = 'paid' | 'partial' | 'overdue' | 'unbilled' | 'credit';
-export type PaymentStatus = 'matched' | 'partial' | 'overpayment' | 'exception' | 'manual';
-export type ExceptionType = 'overpayment' | 'duplicate' | 'misdirected' | 'third_party';
+export type PaymentStatus = 'matched' | 'partial' | 'overpayment' | 'exception' | 'manual' | 'reversed';
+export type ExceptionType = 'overpayment' | 'duplicate' | 'misdirected' | 'third_party' | 'reversal';
 
 export interface Charge {
   id: string;
@@ -24,6 +24,8 @@ export interface LedgerEntry {
   amount: number;
   running: number;
   allocation?: string;
+  // Settlement of THIS charge (charge rows only) — drives the ledger's paid column.
+  settled?: 'paid' | 'partial' | 'unpaid';
 }
 
 export interface Unit {
@@ -33,6 +35,7 @@ export interface Unit {
   groupId: string | null;
   occupant: string;
   phone: string;
+  email: string;
   accountNumber: string;
   occupantType: 'owner' | 'tenant';
   balance: number;
@@ -67,6 +70,7 @@ export interface Vendor {
   name: string;
   category: string;
   bank: string;
+  bankCode: string;
   account: string;
   totalPaid: number;
 }
@@ -74,6 +78,7 @@ export interface Vendor {
 export interface Payout {
   id: string;
   vendorId: string;
+  vendorName: string;
   amount: number;
   note: string;
   date: number;
