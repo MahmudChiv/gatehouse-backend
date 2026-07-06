@@ -102,6 +102,27 @@ export class AuthService {
     };
   }
 
+  // ─── Current manager + estates ───────────────────────────────────────────────
+
+  async me(managerId: string) {
+    const manager = await this.prisma.manager.findUnique({
+      where: { id: managerId },
+      select: { id: true, fullName: true, email: true, phone: true },
+    });
+    const estates = await this.prisma.estate.findMany({
+      where: { managerId, deletedAt: null },
+      select: { id: true, name: true, city: true, cycleLabel: true, _count: { select: { Unit: true } } },
+      orderBy: { createdAt: 'asc' },
+    });
+    return {
+      message: 'OK',
+      data: {
+        manager,
+        estates: estates.map((e) => ({ id: e.id, name: e.name, city: e.city, cycleLabel: e.cycleLabel, unitsCount: e._count.Unit })),
+      },
+    };
+  }
+
   // ─── Helpers ───────────────────────────────────────────────────────────────
 
   private signToken(managerId: string, email: string): string {

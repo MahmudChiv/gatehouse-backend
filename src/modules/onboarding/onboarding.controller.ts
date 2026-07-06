@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Get,
   HttpCode,
   HttpStatus,
   Post,
@@ -32,6 +33,17 @@ import type { CurrentManagerPayload } from '../../common/decorators/current-mana
 @Controller('onboarding')
 export class OnboardingController {
   constructor(private readonly onboardingService: OnboardingService) {}
+
+  // ─── Onboarding progress (resume after refresh) ────────────────────────────
+
+  @Get('state')
+  @ApiOperation({
+    summary: 'Onboarding progress — resume step + existing estate after a refresh',
+  })
+  @ApiResponse({ status: 200, description: 'Current onboarding state' })
+  async getState(@CurrentManager() manager: CurrentManagerPayload) {
+    return this.onboardingService.getState(manager.managerId);
+  }
 
   // ─── Step 1: Create Estate ─────────────────────────────────────────────────
 

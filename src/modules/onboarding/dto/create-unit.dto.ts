@@ -33,6 +33,11 @@ export class UnitItemDto {
   @IsNotEmpty()
   occupant: string;
 
+  @ApiPropertyOptional({ example: '08012345678', description: 'Occupant phone number' })
+  @IsString()
+  @IsOptional()
+  phone?: string;
+
   @ApiProperty({ example: 'emeka.obi@gmail.com', description: 'Occupant contact email for billing notifications' })
   @IsEmail({}, { message: 'Provide a valid email for occupant' })
   email: string;
